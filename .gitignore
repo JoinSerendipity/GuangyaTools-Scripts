@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.mcp/
+.pi-subagents/
+plans/
+scripts/
+package.json
+package-lock.json
+.mcp.json
