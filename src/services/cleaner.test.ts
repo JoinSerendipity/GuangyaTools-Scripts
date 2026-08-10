@@ -37,6 +37,15 @@ describe('cleanup rules', () => {
     expect(matchesCleanupRule(file(), rule({ kind: 'dirName', pattern: 'Advertisement' }))).toBe(false);
   });
 
+  it('keeps original rule ID order across suffix/type indexes and text matchers', () => {
+    const matches = filterCleanupMatches([file()], [
+      rule({ id: 'name', kind: 'fileName', pattern: 'advertisement' }),
+      rule({ id: 'suffix', kind: 'suffix', pattern: 'txt' }),
+      rule({ id: 'type', kind: 'fileType', pattern: '', fileType: FileType.DOCUMENT }),
+    ]);
+    expect(matches[0].ruleIds).toEqual(['name', 'suffix', 'type']);
+  });
+
   it('reports invalid regexp and de-duplicates union matches', () => {
     expect(validateCleanupRule(rule({ matchMode: 'regex', pattern: '[' }))).toContain('正则表达式无效');
     const matches = filterCleanupMatches([file()], [rule(), rule({ id: 'r2', pattern: 'TXT' })]);

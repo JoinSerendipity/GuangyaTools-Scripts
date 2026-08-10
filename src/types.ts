@@ -87,6 +87,11 @@ export interface ProgressInfo {
   message: string;
   current: number;
   total: number;
+  discovered?: number;
+  queued?: number;
+  inFlight?: number;
+  schedulerState?: 'idle' | 'running' | 'throttled' | 'backoff';
+  retryAt?: number;
 }
 
 export interface FailedBatch<T> {
@@ -98,6 +103,8 @@ export interface MutationSummary<T> {
   succeeded: T[];
   failed: FailedBatch<T>[];
   canceled: boolean;
+  outcomeUnknown?: boolean;
+  unsubmitted?: T[];
 }
 
 export interface FlattenConflict {
@@ -116,6 +123,7 @@ export interface FlattenDirectoryResult {
   trashedTopDirectories: GuangyaItem[];
   failures: FailedBatch<GuangyaItem>[];
   canceled: boolean;
+  outcomeUnknown?: boolean;
 }
 
 export type RenameConflictPolicy = 'skip' | 'auto-suffix';
@@ -169,5 +177,6 @@ export interface RenameExecutionResult {
   skipped: RenamePlanEntry[];
   failures: RenameExecutionFailure[];
   canceled: boolean;
+  outcomeUnknown?: boolean;
   residualRisks: string[];
 }

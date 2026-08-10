@@ -6,6 +6,7 @@ import type {
   ProgressInfo,
 } from '../types';
 import type { GuangyaApiLike } from './guangyaApi';
+import type { RequestContext } from './requestContext';
 import { runMutationBatches } from '../utils/batch';
 
 function itemExtension(item: GuangyaItem): string {
@@ -14,12 +15,77 @@ function itemExtension(item: GuangyaItem): string {
   return index > 0 ? item.fileName.slice(index + 1) : '';
 }
 
-function compareText(value: string, rule: CleanupRule): boolean {
-  const flags = rule.caseSensitive ? '' : 'i';
-  if (rule.matchMode === 'regex') return new RegExp(rule.pattern, flags).test(value);
-  const source = rule.caseSensitive ? value : value.toLocaleLowerCase();
+interface CompiledCleanupRule {
+  rule: CleanupRule;
+  order: number;
+  matchesText?: (value: string) => boolean;
+}
+
+interface CompiledCleanupPlan {
+  suffixSensitive: Map<string, CompiledCleanupRule[]>;
+  suffixInsensitive: Map<string, CompiledCleanupRule[]>;
+  fileTypes: Map<number, CompiledCleanupRule[]>;
+  fileNames: CompiledCleanupRule[];
+  directoryNames: CompiledCleanupRule[];
+}
+
+function compileTextMatcher(rule: CleanupRule): (value: string) => boolean {
+  if (rule.matchMode === 'regex') {
+    const regex = new RegExp(rule.pattern, rule.caseSensitive ? '' : 'i');
+    return (value) => regex.test(value);
+  }
   const pattern = rule.caseSensitive ? rule.pattern : rule.pattern.toLocaleLowerCase();
-  return rule.matchMode === 'equals' ? source === pattern : source.includes(pattern);
+  return (value) => {
+    const source = rule.caseSensitive ? value : value.toLocaleLowerCase();
+    return rule.matchMode === 'equals' ? source === pattern : source.includes(pattern);
+  };
+}
+
+function pushIndexed<K>(map: Map<K, CompiledCleanupRule[]>, key: K, value: CompiledCleanupRule): void {
+  const existing = map.get(key);
+  if (existing) existing.push(value);
+  else map.set(key, [value]);
+}
+
+export function compileCleanupRules(rules: readonly CleanupRule[]): CompiledCleanupPlan {
+  const plan: CompiledCleanupPlan = {
+    suffixSensitive: new Map(),
+    suffixInsensitive: new Map(),
+    fileTypes: new Map(),
+    fileNames: [],
+    directoryNames: [],
+  };
+  rules.forEach((rule, order) => {
+    if (!rule.enabled || validateCleanupRule(rule)) return;
+    const compiled: CompiledCleanupRule = { rule, order };
+    if (rule.kind === 'suffix') {
+      pushIndexed(rule.caseSensitive ? plan.suffixSensitive : plan.suffixInsensitive, rule.caseSensitive ? rule.pattern : rule.pattern.toLocaleLowerCase(), compiled);
+    } else if (rule.kind === 'fileType') {
+      pushIndexed(plan.fileTypes, Number(rule.fileType), compiled);
+    } else {
+      compiled.matchesText = compileTextMatcher(rule);
+      (rule.kind === 'fileName' ? plan.fileNames : plan.directoryNames).push(compiled);
+    }
+  });
+  return plan;
+}
+
+function matchesSize(item: GuangyaItem, compiled: CompiledCleanupRule): boolean {
+  return item.resType !== 1 || compiled.rule.maxSizeMb == null || item.fileSize <= compiled.rule.maxSizeMb * 1024 * 1024;
+}
+
+function compiledMatchesForItem(item: GuangyaItem, plan: CompiledCleanupPlan): CompiledCleanupRule[] {
+  const candidates: CompiledCleanupRule[] = [];
+  if (item.resType === 1) {
+    const extension = itemExtension(item);
+    candidates.push(...(plan.suffixSensitive.get(extension) || []));
+    candidates.push(...(plan.suffixInsensitive.get(extension.toLocaleLowerCase()) || []));
+    candidates.push(...(plan.fileTypes.get(item.fileType) || []));
+    for (const compiled of plan.fileNames) if (compiled.matchesText?.(item.fileName)) candidates.push(compiled);
+  } else {
+    for (const compiled of plan.directoryNames) if (compiled.matchesText?.(item.fileName)) candidates.push(compiled);
+  }
+  return candidates.filter((compiled) => matchesSize(item, compiled)).sort((left, right) => left.order - right.order);
 }
 
 export function validateCleanupRule(rule: CleanupRule): string | null {
@@ -42,34 +108,17 @@ export function validateCleanupRule(rule: CleanupRule): string | null {
 }
 
 export function matchesCleanupRule(item: GuangyaItem, rule: CleanupRule): boolean {
-  if (!rule.enabled || validateCleanupRule(rule)) return false;
-  const isFile = item.resType === 1;
-  if (rule.maxSizeMb != null && isFile && item.fileSize > rule.maxSizeMb * 1024 * 1024) return false;
-
-  switch (rule.kind) {
-    case 'suffix':
-      return isFile && compareText(itemExtension(item), { ...rule, matchMode: 'equals' });
-    case 'fileType':
-      return isFile && item.fileType === rule.fileType;
-    case 'fileName':
-      return isFile && compareText(item.fileName, rule);
-    case 'dirName':
-      return !isFile && compareText(item.fileName, rule);
-  }
+  return compiledMatchesForItem(item, compileCleanupRules([rule])).length > 0;
 }
 
 export function filterCleanupMatches(items: readonly GuangyaItem[], rules: readonly CleanupRule[]): CleanupMatch[] {
-  const enabledRules = rules.filter((rule) => rule.enabled);
-  const matchMap = new Map<string, CleanupMatch>();
+  const plan = compileCleanupRules(rules);
+  const matches: CleanupMatch[] = [];
   for (const item of items) {
-    for (const rule of enabledRules) {
-      if (!matchesCleanupRule(item, rule)) continue;
-      const existing = matchMap.get(item.fileId);
-      if (existing) existing.ruleIds.push(rule.id);
-      else matchMap.set(item.fileId, { item, ruleIds: [rule.id] });
-    }
+    const ruleIds = compiledMatchesForItem(item, plan).map((compiled) => compiled.rule.id);
+    if (ruleIds.length) matches.push({ item, ruleIds });
   }
-  return [...matchMap.values()];
+  return matches;
 }
 
 export async function scanCleanup(
@@ -80,6 +129,7 @@ export async function scanCleanup(
     recursive?: boolean;
     signal?: AbortSignal;
     onProgress?: (progress: ProgressInfo) => void;
+    context?: RequestContext;
   } = {},
 ): Promise<CleanupMatch[]> {
   const errors = rules
@@ -90,9 +140,12 @@ export async function scanCleanup(
   if (!rules.some((rule) => rule.enabled)) throw new Error('请至少启用一条清理规则');
 
   options.onProgress?.({ phase: 'scan', message: '正在读取目录内容', current: 0, total: 1 });
-  const items = options.recursive
-    ? (await api.walkDescendants(parentId, options)).items
-    : await api.listAllChildren(parentId, { signal: options.signal, onProgress: options.onProgress });
+  const walk = options.recursive
+    ? await api.walkDescendants(parentId, options)
+    : null;
+  if (walk?.complete === false) throw new Error(walk.incompleteReason || '递归扫描不完整，已停止清理');
+  const items = walk?.items
+    ?? await api.listAllChildren(parentId, { signal: options.signal, context: options.context, onProgress: options.onProgress });
   options.signal?.throwIfAborted();
   const matches = filterCleanupMatches(items, rules);
   options.onProgress?.({
@@ -111,16 +164,17 @@ export async function trashCleanupItems(
     signal?: AbortSignal;
     batchSize?: number;
     onProgress?: (progress: ProgressInfo) => void;
+    context?: RequestContext;
   } = {},
 ): Promise<MutationSummary<GuangyaItem>> {
   const unique = [...new Map(items.map((item) => [item.fileId, item])).values()];
   return runMutationBatches(unique, {
     batchSize: options.batchSize || 50,
-    delayMs: 500,
+    delayMs: 0,
     signal: options.signal,
     phase: 'trash',
-    mutate: (batch) => api.trashItems(batch.map((item) => item.fileId), { signal: options.signal }),
-    waitTask: (taskId) => api.waitTask(taskId),
+    mutate: (batch) => api.trashItems(batch.map((item) => item.fileId), { signal: options.signal, context: options.context }),
+    waitTask: (taskId) => api.waitTask(taskId, { context: options.context }),
     onProgress: options.onProgress,
   });
 }

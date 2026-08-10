@@ -202,6 +202,48 @@ describe('batch rename dependency execution', () => {
     expect(result.canceled).toBe(true);
   });
 
+  it('stops all later renames when a write outcome is unknown', async () => {
+    const a = item('a', 'A.txt');
+    const b = item('b', 'B.txt');
+    const calls: string[] = [];
+    const unknown = Object.assign(new Error('response lost'), { outcome: 'outcome-unknown' });
+    const result = await executeBatchRename(
+      {
+        renameItem: async (fileId, newName) => {
+          calls.push(`${fileId}:${newName}`);
+          throw unknown;
+        },
+      },
+      planFrom([[a, 'C.txt'], [b, 'D.txt']]),
+      [a, b],
+    );
+    expect(calls).toEqual(['a:C.txt']);
+    expect(result.outcomeUnknown).toBe(true);
+    expect(result.skipped.map((entry) => entry.item.fileId)).toEqual(['b']);
+    expect(result.residualRisks.join(' ')).toContain('刷新确认');
+  });
+
+  it('does not attempt automatic rollback after an unknown cycle write', async () => {
+    const a = item('a', 'A.txt');
+    const b = item('b', 'B.txt');
+    const calls: string[] = [];
+    const unknown = Object.assign(new Error('response lost'), { outcome: 'outcome-unknown' });
+    const result = await executeBatchRename(
+      {
+        renameItem: async (fileId, newName) => {
+          calls.push(`${fileId}:${newName}`);
+          if (fileId === 'b') throw unknown;
+        },
+      },
+      planFrom([[a, 'B.txt'], [b, 'A.txt']]),
+      [a, b],
+      { temporaryNameFactory: () => 'TMP.txt' },
+    );
+    expect(calls).toEqual(['a:TMP.txt', 'b:A.txt']);
+    expect(result.outcomeUnknown).toBe(true);
+    expect(result.residualRisks.join(' ')).toContain('未继续提交或自动回滚');
+  });
+
   it('rolls a cycle back when a rename inside the cycle fails', async () => {
     const a = item('a', 'A.txt');
     const b = item('b', 'B.txt');

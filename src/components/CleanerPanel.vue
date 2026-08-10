@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue';
 import ConfirmDialog from './ConfirmDialog.vue';
+import RequestSpeedControl from './RequestSpeedControl.vue';
 import type { CleanupMatch, CleanupRule, DirectoryRef, GuangyaItem, ProgressInfo } from '../types';
 import { FileType } from '../types';
 import type { GuangyaApiLike } from '../services/guangyaApi';
@@ -14,6 +15,9 @@ import {
 } from '../services/cleanerDefaults';
 import { getCurrentDirectory } from '../services/pageAdapter';
 import { useConfirmation } from '../composables/useConfirmation';
+import { createOperationRequestContext } from '../services/requestContext';
+import { initializeOperationSpeedMode } from '../services/requestSpeedSettings';
+import { ProgressTracker } from '../services/progressTracker';
 
 const props = defineProps<{ api: GuangyaApiLike; directory: DirectoryRef }>();
 const emit = defineEmits<{ close: []; completed: [] }>();
@@ -32,6 +36,7 @@ const fileTypes = [
   [FileType.CODE, '代码'], [FileType.OTHER, '其他'], [FileType.UNKNOWN, '未知'],
 ] as const;
 
+const speedMode = ref(initializeOperationSpeedMode());
 const initialDefaults = loadCleanerDefaults();
 const rules = ref<CleanupRule[]>(initialDefaults.rules);
 const recursive = ref(initialDefaults.recursive);
@@ -51,6 +56,7 @@ const failedItems = ref<GuangyaItem[]>([]);
 const page = ref(1);
 const pageSize = 50;
 let controller: AbortController | null = null;
+const progressTracker = new ProgressTracker((value) => { progress.value = value; });
 
 const selectedItems = computed(() => matches.value.filter(({ item }) => selectedIds.value.has(item.fileId)).map(({ item }) => item));
 const selectedSize = computed(() => selectedItems.value.reduce((sum, item) => sum + (item.resType === 1 ? item.fileSize : 0), 0));
@@ -118,19 +124,23 @@ function toggleItem(fileId: string, checked: boolean): void {
 }
 function selectAll(): void { selectedIds.value = new Set(matches.value.map(({ item }) => item.fileId)); }
 function selectNone(): void { selectedIds.value = new Set(); }
-function updateProgress(value: ProgressInfo): void { progress.value = value; }
+function updateProgress(value: ProgressInfo): void { progressTracker.update(value); }
 
 async function scan(): Promise<void> {
   busy.value = true;
   errorMessage.value = '';
   failedItems.value = [];
   controller = new AbortController();
+  progressTracker.reset();
+  const context = createOperationRequestContext(speedMode.value, { signal: controller.signal });
   try {
     matches.value = await scanCleanup(props.api, props.directory.id, rules.value, {
       recursive: recursive.value,
       signal: controller.signal,
+      context,
       onProgress: updateProgress,
     });
+    progressTracker.finish({ phase: 'scan', message: `扫描完成，命中 ${matches.value.length} 项` });
     selectAll();
     page.value = 1;
   } catch (error) {
@@ -145,11 +155,13 @@ async function retryFailures(): Promise<void> {
   busy.value = true;
   errorMessage.value = '';
   controller = new AbortController();
+  progressTracker.reset();
+  const context = createOperationRequestContext(speedMode.value, { signal: controller.signal });
   let present: GuangyaItem[] = [];
   try {
     const currentItems = recursive.value
-      ? (await props.api.walkDescendants(props.directory.id, { signal: controller.signal, onProgress: updateProgress })).items
-      : await props.api.listAllChildren(props.directory.id, { signal: controller.signal });
+      ? (await props.api.walkDescendants(props.directory.id, { signal: controller.signal, context, onProgress: updateProgress })).items
+      : await props.api.listAllChildren(props.directory.id, { signal: controller.signal, context });
     const currentIds = new Set(currentItems.map((item) => item.fileId));
     present = failedItems.value.filter((item) => currentIds.has(item.fileId));
     const goneIds = new Set(failedItems.value.filter((item) => !currentIds.has(item.fileId)).map((item) => item.fileId));
@@ -190,16 +202,33 @@ async function execute(items = selectedItems.value): Promise<void> {
   busy.value = true;
   errorMessage.value = '';
   controller = new AbortController();
+  progressTracker.reset();
+  const context = createOperationRequestContext(speedMode.value, { signal: controller.signal });
   try {
+    const latestWalk = recursive.value
+      ? await props.api.walkDescendants(props.directory.id, { signal: controller.signal, context, purpose: 'verification', onProgress: updateProgress })
+      : null;
+    if (latestWalk?.complete === false) throw new Error(latestWalk.incompleteReason || '执行前复扫不完整');
+    const latestItems = latestWalk?.items
+      ?? await props.api.listAllChildren(props.directory.id, { signal: controller.signal, context, purpose: 'verification', onProgress: updateProgress });
+    const latestIds = new Set(latestItems.map((item) => item.fileId));
+    const missing = items.filter((item) => !latestIds.has(item.fileId));
+    if (missing.length) {
+      errorMessage.value = `确认后有 ${missing.length} 个选中项已不在完整复扫结果中，请重新预扫描`;
+      return;
+    }
     const summary = await trashCleanupItems(props.api, items, {
       signal: controller.signal,
+      context,
       onProgress: updateProgress,
     });
+    progressTracker.finish({ phase: 'trash', message: summary.outcomeUnknown ? '操作结果未知，请刷新确认' : '回收站操作完成' });
     const succeeded = new Set(summary.succeeded.map((item) => item.fileId));
     matches.value = matches.value.filter(({ item }) => !succeeded.has(item.fileId));
-    failedItems.value = summary.failed.flatMap((failure) => failure.items);
+    failedItems.value = [...summary.failed.flatMap((failure) => failure.items), ...(summary.unsubmitted || [])];
     selectedIds.value = new Set(failedItems.value.map((item) => item.fileId));
-    if (summary.failed.length) errorMessage.value = `${summary.failed.length} 个批次失败，可点击“重试失败项”`;
+    if (summary.outcomeUnknown) errorMessage.value = '存在结果未知的批次，已停止后续操作，请刷新目录确认后再重试';
+    else if (summary.failed.length || summary.unsubmitted?.length) errorMessage.value = `${summary.failed.length} 个批次失败或被限流停止，可点击“重试失败项”`;
     if (summary.succeeded.length) emit('completed');
   } catch (error) {
     if (!controller.signal.aborted) errorMessage.value = error instanceof Error ? error.message : String(error);
@@ -209,7 +238,10 @@ async function execute(items = selectedItems.value): Promise<void> {
   }
 }
 
-function cancel(): void { controller?.abort(new DOMException('用户取消操作', 'AbortError')); }
+function cancel(): void {
+  progressTracker.stop();
+  controller?.abort(new DOMException('用户取消操作', 'AbortError'));
+}
 onBeforeUnmount(() => {
   cancel();
   disposeConfirmation();
@@ -229,6 +261,7 @@ onBeforeUnmount(() => {
           <label><input v-model="recursive" type="checkbox" :disabled="busy"> 包含全部子目录（更慢且影响范围更大）</label>
           <span>删除仅进入回收站，不会永久删除。</span>
         </div>
+        <RequestSpeedControl v-model="speedMode" :disabled="busy" />
 
         <div class="gya-rules">
           <div v-for="(rule, index) in rules" :key="rule.id" class="gya-rule">

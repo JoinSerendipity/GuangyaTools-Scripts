@@ -1,11 +1,23 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import ConfirmDialog from './ConfirmDialog.vue';
+import RequestSpeedControl from './RequestSpeedControl.vue';
 import type { FlattenDirectoryResult, GuangyaItem, ProgressInfo } from '../types';
 import type { GuangyaApiLike } from '../services/guangyaApi';
-import { createFlattenPlan, flattenDirectories, type FlattenConflictMode } from '../services/flattenSubfolders';
+import {
+  createFlattenPlan,
+  createFlattenPreviewSnapshot,
+  flattenDirectories,
+  groupDisjointDirectoryWaves,
+  verifyFlattenPreviewSnapshot,
+  type FlattenConflictMode,
+  type FlattenPreviewSnapshot,
+} from '../services/flattenSubfolders';
 import { getCurrentDirectory } from '../services/pageAdapter';
 import { useConfirmation } from '../composables/useConfirmation';
+import { createOperationRequestContext } from '../services/requestContext';
+import { initializeOperationSpeedMode } from '../services/requestSpeedSettings';
+import { ProgressTracker } from '../services/progressTracker';
 
 const props = defineProps<{ api: GuangyaApiLike; directories: GuangyaItem[]; originDirectoryId: string }>();
 const emit = defineEmits<{ close: []; completed: [] }>();
@@ -25,7 +37,9 @@ interface PreviewRow {
   topDirectories: number;
 }
 
+const speedMode = ref(initializeOperationSpeedMode());
 const previews = ref<PreviewRow[]>([]);
+const previewSnapshots = new Map<string, FlattenPreviewSnapshot>();
 const results = ref<FlattenDirectoryResult[]>([]);
 const conflictMode = ref<FlattenConflictMode>('skip');
 const busy = ref(false);
@@ -36,6 +50,7 @@ const progressPercent = computed(() => {
 });
 const errorMessage = ref('');
 let controller: AbortController | null = null;
+const progressTracker = new ProgressTracker((value) => { progress.value = value; });
 
 const totals = computed(() => results.value.reduce((sum, result) => ({
   moved: sum.moved + result.movedFiles.length,
@@ -65,12 +80,20 @@ const safetyConflictText = computed(() => {
 watch(conflictMode, () => {
   if (!previews.value.length && !results.value.length) return;
   previews.value = [];
+  previewSnapshots.clear();
   results.value = [];
   progress.value = null;
   errorMessage.value = '重名处理策略已变化，请重新预检查。';
 });
+watch(speedMode, () => {
+  if (!previews.value.length || busy.value) return;
+  previews.value = [];
+  previewSnapshots.clear();
+  progress.value = null;
+  errorMessage.value = '本次速度策略已变化，请重新预检查。';
+});
 
-function updateProgress(value: ProgressInfo): void { progress.value = value; }
+function updateProgress(value: ProgressInfo): void { progressTracker.update(value); }
 function conflictReason(reason: string): string {
   if (reason === 'target-name-exists') return '目标目录已有同名文件/目录';
   if (reason === 'duplicate-candidate-name') return '候选文件之间重名';
@@ -135,33 +158,55 @@ async function preview(): Promise<void> {
   busy.value = true;
   errorMessage.value = '';
   previews.value = [];
+  previewSnapshots.clear();
   controller = new AbortController();
+  progressTracker.reset();
+  const context = createOperationRequestContext(speedMode.value, { signal: controller.signal });
+  const roots = [...new Map(props.directories.map((directory) => [directory.fileId, directory])).values()];
+  const rootOrder = new Map(roots.map((directory, index) => [directory.fileId, index]));
+  let completed = 0;
   try {
-    for (let index = 0; index < props.directories.length; index += 1) {
-      const directory = props.directories[index];
-      updateProgress({ phase: 'preview', message: `[${index + 1}/${props.directories.length}] 预扫描「${directory.fileName}」`, current: index, total: props.directories.length });
-      const walk = await props.api.walkDescendants(directory.fileId, {
-        signal: controller.signal,
-        onProgress: (scanProgress) => {
-          const total = scanProgress.total > 0 ? scanProgress.total : 1;
-          const ratio = Math.min(1, Math.max(0, scanProgress.current / total));
-          updateProgress({
-            phase: 'preview',
-            message: `[${index + 1}/${props.directories.length}] 预扫描「${directory.fileName}」：${scanProgress.message}`,
-            current: index + ratio,
-            total: props.directories.length,
-          });
-        },
-      });
-      const safePlan = createFlattenPlan(directory, walk, { conflictMode: 'skip' });
-      const plan = conflictMode.value === 'skip'
-        ? safePlan
-        : createFlattenPlan(directory, walk, { conflictMode: conflictMode.value });
-      previews.value.push({ directory, scannedFiles: walk.files.length, movableFiles: plan.movableFiles.length, conflicts: safePlan.conflicts.length, topDirectories: plan.topDirectories.length });
-      updateProgress({ phase: 'preview', message: `[${index + 1}/${props.directories.length}] 已完成「${directory.fileName}」预扫描`, current: index + 1, total: props.directories.length });
+    for (const wave of groupDisjointDirectoryWaves(roots)) {
+      let waveCompleted = 0;
+      const rows = await Promise.all(wave.map(async (directory): Promise<PreviewRow> => {
+        updateProgress({ phase: 'preview', message: `并发预扫描「${directory.fileName}」`, current: completed, total: roots.length, inFlight: wave.length });
+        const walk = await props.api.walkDescendants(directory.fileId, {
+          signal: controller!.signal,
+          context,
+          purpose: 'consistency',
+          onProgress: (scanProgress) => {
+            if (controller?.signal.aborted) return;
+            updateProgress({
+              ...scanProgress,
+              phase: 'preview',
+              message: `预扫描「${directory.fileName}」：${scanProgress.message}`,
+              current: completed,
+              total: roots.length,
+              inFlight: Math.max(0, wave.length - waveCompleted),
+            });
+          },
+        });
+        if (controller?.signal.aborted) throw controller.signal.reason;
+        if (walk.complete === false) throw new Error(walk.incompleteReason || `「${directory.fileName}」扫描不完整`);
+        const snapshot = createFlattenPreviewSnapshot(directory, walk, conflictMode.value, speedMode.value);
+        previewSnapshots.set(directory.fileId, snapshot);
+        const safePlan = createFlattenPlan(directory, walk, { conflictMode: 'skip' });
+        const plan = conflictMode.value === 'skip' ? safePlan : createFlattenPlan(directory, walk, { conflictMode: conflictMode.value });
+        completed += 1;
+        waveCompleted += 1;
+        updateProgress({ phase: 'preview', message: `已完成「${directory.fileName}」预扫描（${completed}/${roots.length}）`, current: completed, total: roots.length, inFlight: Math.max(0, wave.length - waveCompleted) });
+        return { directory, scannedFiles: walk.files.length, movableFiles: plan.movableFiles.length, conflicts: safePlan.conflicts.length, topDirectories: plan.topDirectories.length };
+      }));
+      previews.value.push(...rows);
+      previews.value.sort((left, right) => (rootOrder.get(left.directory.fileId) || 0) - (rootOrder.get(right.directory.fileId) || 0));
     }
+    progressTracker.finish({ phase: 'preview', message: `预扫描完成：${roots.length} 个目录` });
   } catch (error) {
-    if (!controller.signal.aborted) errorMessage.value = error instanceof Error ? error.message : String(error);
+    if (!controller.signal.aborted) {
+      errorMessage.value = error instanceof Error ? error.message : String(error);
+      controller.abort(new DOMException('同波次预扫描失败', 'AbortError'));
+    }
+    progressTracker.stop();
   } finally {
     busy.value = false;
     controller = null;
@@ -170,27 +215,69 @@ async function preview(): Promise<void> {
 
 async function execute(targets = props.directories): Promise<void> {
   if (!targets.length || !ensureOrigin()) return;
+  const missingSnapshot = targets.find((item) => !previewSnapshots.has(item.fileId));
+  if (missingSnapshot) {
+    errorMessage.value = `「${missingSnapshot.fileName}」缺少完整预检查快照，请重新预检查`;
+    return;
+  }
+
   const previewMap = new Map(previews.value.map((row) => [row.directory.fileId, row]));
   const moving = targets.reduce((sum, item) => sum + (previewMap.get(item.fileId)?.movableFiles || 0), 0);
   const conflicts = targets.reduce((sum, item) => sum + (previewMap.get(item.fileId)?.conflicts || 0), 0);
   const conflictMessage = usesGuangyaDefault.value
     ? `检测到 ${conflicts} 个重名项，将交给光鸭默认处理（通常在文件名后追加 (1)、(2) 等，最终以服务端行为为准）`
     : trashesConflicts.value
-      ? `${conflicts} 个候选重名文件将移入回收站；其直接父目录仅在复扫确认没有其他文件时才会回收`
+      ? `${conflicts} 个候选重名文件将移入回收站；其目录只在最终稳定复核确认安全时回收`
       : `${conflicts} 个同名冲突文件会保留不处理`;
   if (!await askConfirmation({
     title: '确认解散子目录',
-    message: `将处理 ${targets.length} 个目录，提交移动约 ${moving} 个文件。\n${conflictMessage}。\n仅在复扫确认子目录树没有文件后，才会将空目录移入回收站。`,
-    confirmText: '开始处理',
+    message: `将处理 ${targets.length} 个目录，计划移动约 ${moving} 个文件。\n${conflictMessage}。\n确认后会立即进行完整一致性复核；发现任何变化都不会写入。目录仅在最终双 Pass 稳定验证后移入回收站。`,
+    confirmText: '复核并开始处理',
     danger: true,
   })) return;
   if (!ensureOrigin()) return;
+  if (targets.some((item) => !previewSnapshots.has(item.fileId))) {
+    errorMessage.value = '确认期间设置或预检查结果已变化，请重新预检查。';
+    return;
+  }
 
   busy.value = true;
   errorMessage.value = '';
   controller = new AbortController();
+  progressTracker.reset();
+  const context = createOperationRequestContext(speedMode.value, { signal: controller.signal });
+  const validatedSnapshots = new Map<string, FlattenPreviewSnapshot>();
   try {
-    const next = await flattenDirectories(props.api, targets, { signal: controller.signal, onProgress: updateProgress, conflictMode: conflictMode.value });
+    for (let index = 0; index < targets.length; index += 1) {
+      const directory = targets[index];
+      updateProgress({ phase: 'snapshot-verify', message: `正在检测「${directory.fileName}」预检查后的变化`, current: index, total: targets.length });
+      const checked = await verifyFlattenPreviewSnapshot(props.api, directory, previewSnapshots.get(directory.fileId)!, {
+        signal: controller.signal,
+        context,
+        conflictMode: conflictMode.value,
+        speedMode: speedMode.value,
+      });
+      previewSnapshots.set(directory.fileId, checked.snapshot);
+      if (!checked.unchanged) {
+        const safePlan = createFlattenPlan(directory, checked.snapshot.walk, { conflictMode: 'skip' });
+        const plan = conflictMode.value === 'skip' ? safePlan : createFlattenPlan(directory, checked.snapshot.walk, { conflictMode: conflictMode.value });
+        const row: PreviewRow = { directory, scannedFiles: checked.snapshot.walk.files.length, movableFiles: plan.movableFiles.length, conflicts: safePlan.conflicts.length, topDirectories: plan.topDirectories.length };
+        previews.value = [...previews.value.filter((entry) => entry.directory.fileId !== directory.fileId), row];
+        errorMessage.value = `「${directory.fileName}」在预检查后发生变化，预览已刷新；本次未写入，请核对后再次开始解散。`;
+        progressTracker.stop();
+        return;
+      }
+      validatedSnapshots.set(directory.fileId, checked.snapshot);
+    }
+
+    const next = await flattenDirectories(props.api, targets, {
+      signal: controller.signal,
+      context,
+      snapshots: validatedSnapshots,
+      onProgress: updateProgress,
+      conflictMode: conflictMode.value,
+    });
+    progressTracker.finish({ phase: 'directory', message: next.some((result) => result.outcomeUnknown) ? '存在结果未知的操作，请刷新确认' : '解散处理完成' });
     const retriedIds = new Set(targets.map((item) => item.fileId));
     results.value = [...results.value.filter((result) => !retriedIds.has(result.directory.fileId)), ...next];
     if (next.some((result) => result.movedFiles.length || result.trashedConflictFiles.length || result.trashedConflictDirectories.length || result.trashedTopDirectories.length)) emit('completed');
@@ -203,7 +290,10 @@ async function execute(targets = props.directories): Promise<void> {
   }
 }
 
-function cancel(): void { controller?.abort(new DOMException('用户取消操作', 'AbortError')); }
+function cancel(): void {
+  progressTracker.stop();
+  controller?.abort(new DOMException('用户取消操作', 'AbortError'));
+}
 onBeforeUnmount(() => {
   cancel();
   disposeConfirmation();
@@ -216,6 +306,7 @@ onBeforeUnmount(() => {
       <section class="gya-panel" aria-label="光鸭解散子目录工具">
         <header><div><h2>解散子目录</h2><p>把所有后代文件移动到选中目录，并清理确认无文件的子目录树。</p></div><button :disabled="busy" @click="emit('close')">×</button></header>
         <div class="gya-warning"><b>安全策略</b><span>{{ safetyConflictText }}有残留或移动失败的目录不会删除；文件和目录删除都只进入回收站。</span></div>
+        <RequestSpeedControl v-model="speedMode" :disabled="busy" />
         <fieldset class="gya-conflict-mode" :disabled="busy">
           <legend>重名处理策略</legend>
           <label><input v-model="conflictMode" type="radio" value="skip"> <span><b>保留不处理（安全，默认）</b><small>提前跳过重名文件，相关子目录会保留。</small></span></label>

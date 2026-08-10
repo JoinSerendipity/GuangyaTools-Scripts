@@ -9,9 +9,11 @@ import type {
   RenamePlanEntry,
   RenameFailurePhase,
 } from '../types';
+import type { ApiOperationOptions } from './guangyaApi';
+import type { RequestContext } from './requestContext';
 
 export interface RenameApiLike {
-  renameItem(fileId: string, newName: string): Promise<void>;
+  renameItem(fileId: string, newName: string, options?: ApiOperationOptions): Promise<void>;
 }
 
 export interface NameParts {
@@ -220,6 +222,7 @@ interface SuccessfulOperation {
 
 interface ExecuteOptions {
   signal?: AbortSignal;
+  context?: RequestContext;
   onProgress?: (progress: ProgressInfo) => void;
   temporaryNameFactory?: (entry: RenamePlanEntry, index: number) => string;
 }
@@ -260,6 +263,8 @@ export async function executeBatchRename(
   let settled = 0;
   let temporarySequence = 0;
   let canceled = false;
+  let outcomeUnknown = false;
+  let rateLimitedStop = false;
 
   const report = (message: string): void => options.onProgress?.({
     phase: 'rename',
@@ -288,10 +293,13 @@ export async function executeBatchRename(
         : `正在重命名「${fromName}」→「${toName}」`);
     try {
       // 单项请求开始后等待其明确结果；取消只阻止尚未提交的后续重命名。
-      await api.renameItem(entry.item.fileId, toName);
+      await api.renameItem(entry.item.fileId, toName, { signal: options.signal, context: options.context });
       updateOccupancy(entry.item.fileId, fromName, toName);
       return null;
     } catch (error) {
+      const outcome = error && typeof error === 'object' && 'outcome' in error ? String((error as { outcome?: unknown }).outcome || '') : '';
+      if (outcome === 'outcome-unknown' || outcome === 'task-unknown') outcomeUnknown = true;
+      if (error && typeof error === 'object' && 'rateLimited' in error && (error as { rateLimited?: unknown }).rateLimited) rateLimitedStop = true;
       return errorMessage(error);
     }
   };
@@ -321,6 +329,7 @@ export async function executeBatchRename(
           error: rollbackError,
         });
         residualRisks.push(`「${operation.entry.originalName}」可能仍使用中转名称「${currentName}」，请刷新后确认`);
+        if (outcomeUnknown || rateLimitedStop) return;
       }
     }
   };
@@ -344,7 +353,7 @@ export async function executeBatchRename(
     return [];
   };
 
-  while (pending.size > 0) {
+  executionLoop: while (pending.size > 0) {
     if (options.signal?.aborted) {
       canceled = true;
       break;
@@ -361,6 +370,12 @@ export async function executeBatchRename(
       settled += 1;
       if (renameError) {
         failures.push({ item: directlyReady.item, fromName, toName: directlyReady.finalName, phase: 'rename', error: renameError });
+        if (outcomeUnknown || rateLimitedStop) {
+          residualRisks.push(outcomeUnknown
+            ? `「${directlyReady.originalName}」的服务端结果未知，已停止后续重命名，请刷新确认`
+            : '检测到请求频率限制，已停止后续重命名');
+          break;
+        }
       } else {
         succeeded.push(directlyReady);
       }
@@ -393,6 +408,12 @@ export async function executeBatchRename(
     const tempError = await perform(root, rootFrom, temporaryName, 'temporary');
     if (tempError) {
       failures.push({ item: root.item, fromName: rootFrom, toName: temporaryName, phase: 'temporary', error: tempError });
+      if (outcomeUnknown || rateLimitedStop) {
+        residualRisks.push(outcomeUnknown
+          ? `「${root.originalName}」是否已使用中转名称未知，已停止后续重命名，请刷新确认`
+          : '检测到请求频率限制，已停止循环及后续重命名');
+        break;
+      }
       for (const entry of cycle) {
         if (entry.item.fileId !== root.item.fileId) {
           failures.push({ item: entry.item, fromName: entry.originalName, toName: entry.finalName, phase: 'blocked', error: '循环中转名称创建失败' });
@@ -429,8 +450,18 @@ export async function executeBatchRename(
       cyclePending.delete(next.item.fileId);
     }
 
+    if (outcomeUnknown || rateLimitedStop) {
+      residualRisks.push(outcomeUnknown
+        ? '循环中的写入结果未知，未继续提交或自动回滚，请刷新目录确认实际名称'
+        : '循环中触发请求频率限制，已停止提交和自动回滚，请刷新确认名称');
+      break executionLoop;
+    }
     if (cycleError || canceled) {
       await rollbackCycle(operations);
+      if (outcomeUnknown || rateLimitedStop) {
+        residualRisks.push(outcomeUnknown ? '循环回滚结果未知，已停止剩余回滚和后续重命名，请刷新确认' : '循环回滚触发请求频率限制，已停止剩余请求');
+        break executionLoop;
+      }
       if (cycleError) {
         failures.push({
           item: cycleError.entry.item,
@@ -468,13 +499,14 @@ export async function executeBatchRename(
     }
   }
 
-  const canceledPending = canceled ? [...pending.values()] : [];
-  report(canceled ? '批量重命名已取消' : '批量重命名完成');
+  const stoppedPending = canceled || outcomeUnknown || rateLimitedStop ? [...pending.values()] : [];
+  report(canceled ? '批量重命名已取消' : outcomeUnknown ? '批量重命名因结果未知而停止' : rateLimitedStop ? '批量重命名因请求频率限制而停止' : '批量重命名完成');
   return {
     succeeded,
-    skipped: [...plan.entries.filter((entry) => entry.status !== 'ready'), ...canceledPending],
+    skipped: [...plan.entries.filter((entry) => entry.status !== 'ready'), ...stoppedPending],
     failures,
     canceled,
+    outcomeUnknown,
     residualRisks,
   };
 }

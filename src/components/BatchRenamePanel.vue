@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import ConfirmDialog from './ConfirmDialog.vue';
+import RequestSpeedControl from './RequestSpeedControl.vue';
 import type { BatchRenameRules, DirectoryRef, GuangyaItem, ProgressInfo, RenameConflictPolicy, RenamePlanEntry } from '../types';
 import type { GuangyaApiLike } from '../services/guangyaApi';
 import {
@@ -11,6 +12,9 @@ import {
 } from '../services/batchRename';
 import { getCurrentDirectory } from '../services/pageAdapter';
 import { useConfirmation } from '../composables/useConfirmation';
+import { createOperationRequestContext } from '../services/requestContext';
+import { initializeOperationSpeedMode } from '../services/requestSpeedSettings';
+import { ProgressTracker } from '../services/progressTracker';
 
 const props = defineProps<{ api: GuangyaApiLike; items: GuangyaItem[]; directory: DirectoryRef }>();
 const emit = defineEmits<{ close: []; completed: [] }>();
@@ -22,7 +26,9 @@ const {
   disposeConfirmation,
 } = useConfirmation();
 
+const speedMode = ref(initializeOperationSpeedMode());
 const rules = ref<BatchRenameRules>({ ...DEFAULT_BATCH_RENAME_RULES });
+const searchEditor = ref<HTMLTextAreaElement | null>(null);
 const conflictPolicy = ref<RenameConflictPolicy>('skip');
 const siblings = ref<GuangyaItem[]>([]);
 const manualOverrides = ref<Record<string, string>>({});
@@ -33,6 +39,7 @@ const progress = ref<ProgressInfo | null>(null);
 const errorMessage = ref('');
 const executionResult = ref<Awaited<ReturnType<typeof executeBatchRename>> | null>(null);
 let controller: AbortController | null = null;
+const progressTracker = new ProgressTracker((value) => { progress.value = value; });
 
 const plan = computed(() => createBatchRenamePlan(
   props.items,
@@ -50,7 +57,7 @@ const progressPercent = computed(() => {
   return Math.round(Math.min(100, Math.max(0, (progress.value.current / progress.value.total) * 100)));
 });
 
-function updateProgress(value: ProgressInfo): void { progress.value = value; }
+function updateProgress(value: ProgressInfo): void { progressTracker.update(value); }
 function fixedExtension(entry: RenamePlanEntry): string {
   return rules.value.preserveExtension && entry.item.resType === 1
     ? splitFileName(entry.item.fileName).extension
@@ -62,6 +69,26 @@ function editableName(entry: RenamePlanEntry): string {
 }
 function setManualName(entry: RenamePlanEntry, value: string): void {
   manualOverrides.value = { ...manualOverrides.value, [entry.item.fileId]: `${value}${fixedExtension(entry)}` };
+}
+function searchableOriginalName(entry: RenamePlanEntry): string {
+  return rules.value.preserveExtension && entry.item.resType === 1
+    ? splitFileName(entry.originalName).stem
+    : entry.originalName;
+}
+async function fillOriginalIntoSearch(entry: RenamePlanEntry): Promise<void> {
+  rules.value.search = searchableOriginalName(entry);
+  await nextTick();
+  searchEditor.value?.focus();
+  searchEditor.value?.select();
+}
+async function copyOriginalName(entry: RenamePlanEntry): Promise<void> {
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
+    await navigator.clipboard.writeText(entry.originalName);
+    errorMessage.value = `已复制原名称：${entry.originalName}`;
+  } catch {
+    window.prompt('复制完整原名称', entry.originalName);
+  }
 }
 function resetManualName(fileId: string): void {
   const next = { ...manualOverrides.value };
@@ -94,13 +121,16 @@ async function loadSiblings(): Promise<void> {
   busy.value = true;
   errorMessage.value = '';
   controller = new AbortController();
+  progressTracker.reset();
+  const context = createOperationRequestContext(speedMode.value, { signal: controller.signal });
   try {
     siblings.value = await props.api.listAllChildren(props.directory.id, {
       signal: controller.signal,
+      context,
       onProgress: updateProgress,
     });
     loaded.value = true;
-    updateProgress({ phase: 'rename-preview', message: `已读取当前目录 ${siblings.value.length} 项`, current: 1, total: 1 });
+    progressTracker.finish({ phase: 'rename-preview', message: `已读取当前目录 ${siblings.value.length} 项`, total: 1 });
   } catch (error) {
     if (!controller.signal.aborted) errorMessage.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -116,9 +146,13 @@ async function execute(): Promise<void> {
   busy.value = true;
   errorMessage.value = '';
   controller = new AbortController();
+  progressTracker.reset();
+  const preflightContext = createOperationRequestContext(speedMode.value, { signal: controller.signal });
   try {
     const latestSiblings = await props.api.listAllChildren(props.directory.id, {
       signal: controller.signal,
+      context: preflightContext,
+      purpose: 'verification',
       onProgress: updateProgress,
     });
     const latestIds = new Set(latestSiblings.map((item) => item.fileId));
@@ -155,11 +189,15 @@ async function execute(): Promise<void> {
   errorMessage.value = '';
   executionResult.value = null;
   controller = new AbortController();
+  progressTracker.reset();
+  const context = createOperationRequestContext(speedMode.value, { signal: controller.signal });
   try {
     executionResult.value = await executeBatchRename(props.api, currentPlan, siblings.value, {
       signal: controller.signal,
+      context,
       onProgress: updateProgress,
     });
+    progressTracker.finish({ phase: 'rename', message: executionResult.value.outcomeUnknown ? '重命名结果未知，请刷新确认' : '批量重命名完成' });
     completed.value = true;
     if (executionResult.value.succeeded.length) emit('completed');
     if (executionResult.value.failures.length) errorMessage.value = '部分项目重命名失败，请查看下方失败详情并刷新目录确认。';
@@ -171,7 +209,10 @@ async function execute(): Promise<void> {
   }
 }
 
-function cancel(): void { controller?.abort(new DOMException('用户取消操作', 'AbortError')); }
+function cancel(): void {
+  progressTracker.stop();
+  controller?.abort(new DOMException('用户取消操作', 'AbortError'));
+}
 onMounted(loadSiblings);
 onBeforeUnmount(() => {
   cancel();
@@ -187,15 +228,18 @@ onBeforeUnmount(() => {
           <div><h2>批量重命名</h2><p>当前目录：{{ directory.name }}；已选择 {{ items.length }} 项</p></div>
           <button class="gya-close" :disabled="busy" @click="emit('close')">×</button>
         </header>
+        <RequestSpeedControl v-model="speedMode" :disabled="busy || completed" />
 
         <div class="gya-rules">
-          <fieldset>
+          <fieldset class="gya-replace-field">
             <legend>查找替换</legend>
             <div class="gya-grid gya-replace-grid">
-              <label>查找<input v-model="rules.search" :disabled="busy || completed" placeholder="留空表示不替换"></label>
-              <label>替换为<input v-model="rules.replacement" :disabled="busy || completed" placeholder="可留空"></label>
-              <label class="gya-check"><input v-model="rules.useRegex" type="checkbox" :disabled="busy || completed"> 正则表达式</label>
-              <label class="gya-check"><input v-model="rules.caseSensitive" type="checkbox" :disabled="busy || completed"> 区分大小写</label>
+              <label class="gya-replace-editor">查找<textarea ref="searchEditor" v-model="rules.search" rows="3" wrap="soft" spellcheck="false" :disabled="busy || completed" aria-label="查找内容" placeholder="留空表示不替换"></textarea></label>
+              <label class="gya-replace-editor">替换为<textarea v-model="rules.replacement" rows="3" wrap="soft" spellcheck="false" :disabled="busy || completed" aria-label="替换内容" placeholder="可留空"></textarea></label>
+              <div class="gya-replace-options">
+                <label class="gya-check"><input v-model="rules.useRegex" type="checkbox" :disabled="busy || completed"> 正则表达式</label>
+                <label class="gya-check"><input v-model="rules.caseSensitive" type="checkbox" :disabled="busy || completed"> 区分大小写</label>
+              </div>
             </div>
           </fieldset>
 
@@ -242,10 +286,16 @@ onBeforeUnmount(() => {
               <thead><tr><th>#</th><th>原名称</th><th>新名称（可逐项编辑）</th><th>状态</th><th></th></tr></thead>
               <tbody><tr v-for="(entry, index) in plan.entries" :key="entry.item.fileId" :class="`status-${entry.status}`">
                 <td>{{ index + 1 }}</td>
-                <td :title="entry.originalName">{{ entry.originalName }}</td>
+                <td class="gya-original-cell">
+                  <div class="gya-original-name" :title="entry.originalName" tabindex="0">{{ entry.originalName }}</div>
+                  <div class="gya-original-actions">
+                    <button class="gya-link" type="button" :disabled="busy || completed" @click="fillOriginalIntoSearch(entry)">填入查找</button>
+                    <button class="gya-link" type="button" :disabled="busy || completed" @click="copyOriginalName(entry)">复制原名</button>
+                  </div>
+                </td>
                 <td>
                   <div class="gya-name-editor">
-                    <input :value="editableName(entry)" :disabled="busy || completed" @input="setManualName(entry, ($event.target as HTMLInputElement).value)">
+                    <textarea :value="editableName(entry)" rows="2" wrap="soft" spellcheck="false" :aria-label="`编辑新名称：${entry.originalName}`" :disabled="busy || completed" @input="setManualName(entry, ($event.target as HTMLTextAreaElement).value)"></textarea>
                     <span v-if="fixedExtension(entry)" class="gya-extension">{{ fixedExtension(entry) }}</span>
                   </div>
                   <small v-if="entry.finalName !== entry.requestedName">请求：{{ entry.requestedName }}</small>
@@ -282,5 +332,5 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.gya-mask{position:fixed;inset:0;z-index:2147483645;background:rgba(15,23,42,.42);display:flex;justify-content:flex-end;font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;color:#1f2937}.gya-panel{width:min(1080px,96vw);height:100vh;overflow:auto;background:#fff;padding:20px 24px;box-sizing:border-box;box-shadow:-8px 0 30px rgba(0,0,0,.16)}header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid #e5e7eb;margin-bottom:12px}h2{margin:0;font-size:22px}header p{margin:4px 0 12px;color:#64748b}.gya-close{border:0;background:none;font-size:30px;cursor:pointer}.gya-rules{display:grid;grid-template-columns:1fr 1fr;gap:10px}.gya-rules fieldset{border:1px solid #cbd5e1;border-radius:8px;padding:10px 12px;min-width:0}.gya-rules legend{font-weight:700;padding:0 5px}.gya-sequence-field{grid-column:1/-1}.gya-grid{display:grid;gap:8px;align-items:end}.gya-replace-grid{grid-template-columns:1fr 1fr auto auto}.gya-affix-grid{grid-template-columns:1fr 1fr auto}.gya-sequence-grid{grid-template-columns:repeat(5,minmax(0,1fr))}.gya-grid label:not(.gya-check){display:flex;flex-direction:column;min-width:0;color:#475569;font-size:12px}.gya-grid input,.gya-grid select{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:6px;padding:7px;min-width:0;background:#fff}.gya-check{display:flex;align-items:center;gap:5px;white-space:nowrap}.gya-policy{display:flex;gap:7px;padding:6px;cursor:pointer}.gya-policy span{display:flex;flex-direction:column}.gya-policy small{color:#64748b}.gya-progress{margin:12px 0}.gya-progress-head{display:flex;justify-content:space-between;gap:12px;color:#475569;font-size:13px}.gya-progress-track{height:8px;background:#e2e8f0;border-radius:999px;overflow:hidden;margin-top:5px}.gya-progress-track span{display:block;height:100%;background:linear-gradient(90deg,#2563eb,#60a5fa);transition:width .2s ease}.gya-error{color:#b91c1c;background:#fef2f2;padding:8px 10px;border-radius:6px}.gya-summary{display:flex;justify-content:space-between;align-items:center;margin:12px 0}.gya-summary button,.gya-link{border:0;background:none;color:#2563eb;cursor:pointer}.gya-table-wrap{overflow:auto;max-height:42vh;border:1px solid #e5e7eb;border-radius:8px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;border-bottom:1px solid #f1f5f9;vertical-align:middle}th{position:sticky;top:0;background:#f8fafc;z-index:1}td:nth-child(2){max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.gya-name-editor{display:flex;align-items:center;min-width:300px}.gya-name-editor input{flex:1;min-width:100px;border:1px solid #cbd5e1;border-radius:6px 0 0 6px;padding:7px}.gya-extension{padding:7px 8px;background:#f1f5f9;border:1px solid #cbd5e1;border-left:0;border-radius:0 6px 6px 0;color:#475569}.gya-name-editor input:only-child{border-radius:6px}.gya-table-wrap small{color:#64748b}.gya-status{font-size:12px}.status-invalid .gya-status,.status-conflict .gya-status{color:#b91c1c}.status-unchanged .gya-status{color:#64748b}.status-ready .gya-status{color:#166534}.gya-result{margin-top:12px;padding:10px;background:#f0fdf4;color:#166534;border-radius:8px}.gya-failures{margin-top:10px;border:1px solid #fecaca;border-radius:8px;padding:8px 12px}.gya-failures li{margin:5px 0;word-break:break-all}.warn{color:#b45309}footer{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}.gya-primary,.gya-secondary{border:0;border-radius:7px;padding:8px 14px;cursor:pointer}.gya-primary{background:#2563eb;color:#fff}.gya-secondary{background:#e2e8f0;color:#1e293b}button:disabled,input:disabled,select:disabled{opacity:.55;cursor:not-allowed}@media(max-width:800px){.gya-panel{padding:14px}.gya-rules{grid-template-columns:1fr}.gya-replace-grid,.gya-affix-grid,.gya-sequence-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.gya-name-editor{min-width:220px}}@media(max-width:480px){.gya-replace-grid,.gya-affix-grid,.gya-sequence-grid{grid-template-columns:1fr}}
+.gya-mask{position:fixed;inset:0;z-index:2147483645;background:rgba(15,23,42,.42);display:flex;justify-content:flex-end;font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;color:#1f2937}.gya-panel{width:min(1080px,96vw);height:100vh;overflow:auto;background:#fff;padding:20px 24px;box-sizing:border-box;box-shadow:-8px 0 30px rgba(0,0,0,.16)}.gya-panel ::selection,.gya-panel input::selection,.gya-panel textarea::selection,.gya-original-name::selection{background:#1d4ed8!important;color:#fff!important}.gya-panel ::-moz-selection,.gya-panel input::-moz-selection,.gya-panel textarea::-moz-selection,.gya-original-name::-moz-selection{background:#1d4ed8!important;color:#fff!important}header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid #e5e7eb;margin-bottom:12px}h2{margin:0;font-size:22px}header p{margin:4px 0 12px;color:#64748b}.gya-close{border:0;background:none;font-size:30px;cursor:pointer}.gya-rules{display:grid;grid-template-columns:1fr 1fr;gap:10px}.gya-rules fieldset{border:1px solid #cbd5e1;border-radius:8px;padding:10px 12px;min-width:0}.gya-rules legend{font-weight:700;padding:0 5px}.gya-replace-field,.gya-sequence-field{grid-column:1/-1}.gya-grid{display:grid;gap:8px;align-items:end}.gya-replace-grid{grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}.gya-replace-options{grid-column:1/-1;display:flex;align-items:center;flex-wrap:wrap;gap:8px 18px;padding-top:2px}.gya-affix-grid{grid-template-columns:1fr 1fr auto}.gya-sequence-grid{grid-template-columns:repeat(5,minmax(0,1fr))}.gya-grid label:not(.gya-check){display:flex;flex-direction:column;min-width:0;color:#475569;font-size:12px}.gya-grid input,.gya-grid select,.gya-grid textarea{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:6px;padding:7px;min-width:0;background:#fff}.gya-replace-editor textarea{min-height:78px;max-height:240px;resize:vertical;overflow-x:hidden;overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace}.gya-check{display:flex;align-items:center;gap:5px;white-space:nowrap}.gya-policy{display:flex;gap:7px;padding:6px;cursor:pointer}.gya-policy span{display:flex;flex-direction:column}.gya-policy small{color:#64748b}.gya-progress{margin:12px 0}.gya-progress-head{display:flex;justify-content:space-between;gap:12px;color:#475569;font-size:13px}.gya-progress-track{height:8px;background:#e2e8f0;border-radius:999px;overflow:hidden;margin-top:5px}.gya-progress-track span{display:block;height:100%;background:linear-gradient(90deg,#2563eb,#60a5fa);transition:width .2s ease}.gya-error{color:#b91c1c;background:#fef2f2;padding:8px 10px;border-radius:6px}.gya-summary{display:flex;justify-content:space-between;align-items:center;margin:12px 0}.gya-summary button,.gya-link{border:0;background:none;color:#2563eb;cursor:pointer}.gya-table-wrap{overflow:auto;max-height:42vh;border:1px solid #e5e7eb;border-radius:8px}table{width:100%;min-width:900px;table-layout:fixed;border-collapse:collapse}th,td{text-align:left;padding:8px;border-bottom:1px solid #f1f5f9;vertical-align:middle}th{position:sticky;top:0;background:#f8fafc;z-index:1}th:nth-child(1){width:44px}th:nth-child(2){width:28%}th:nth-child(3){width:42%}th:nth-child(4){width:120px}th:nth-child(5){width:90px}.gya-original-cell{min-width:0}.gya-original-name{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;user-select:text;cursor:text;line-height:1.5}.gya-original-name:focus{outline:2px solid #93c5fd;outline-offset:2px;border-radius:3px}.gya-original-actions{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:5px}.gya-original-actions .gya-link{padding:2px 0;font-size:12px}.gya-name-editor{display:flex;align-items:stretch;min-width:0;width:100%}.gya-name-editor textarea{flex:1;min-width:0;min-height:54px;max-height:180px;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:6px 0 0 6px;padding:7px;resize:vertical;overflow-x:hidden;overflow-y:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace}.gya-extension{display:flex;align-items:center;max-width:35%;padding:7px 8px;background:#f1f5f9;border:1px solid #cbd5e1;border-left:0;border-radius:0 6px 6px 0;color:#475569;overflow-wrap:anywhere}.gya-name-editor textarea:only-child{border-radius:6px}.gya-table-wrap small{color:#64748b}.gya-status{font-size:12px}.status-invalid .gya-status,.status-conflict .gya-status{color:#b91c1c}.status-unchanged .gya-status{color:#64748b}.status-ready .gya-status{color:#166534}.gya-result{margin-top:12px;padding:10px;background:#f0fdf4;color:#166534;border-radius:8px}.gya-failures{margin-top:10px;border:1px solid #fecaca;border-radius:8px;padding:8px 12px}.gya-failures li{margin:5px 0;word-break:break-all}.warn{color:#b45309}footer{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}.gya-primary,.gya-secondary{border:0;border-radius:7px;padding:8px 14px;cursor:pointer}.gya-primary{background:#2563eb;color:#fff}.gya-secondary{background:#e2e8f0;color:#1e293b}button:disabled,input:disabled,select:disabled,textarea:disabled{opacity:.55;cursor:not-allowed;background:#f8fafc}@media(max-width:800px){.gya-panel{padding:14px}.gya-rules{grid-template-columns:1fr}.gya-replace-grid,.gya-affix-grid,.gya-sequence-grid{grid-template-columns:repeat(2,minmax(0,1fr))}table{min-width:820px}th:nth-child(2){width:30%}th:nth-child(3){width:40%}}@media(max-width:480px){.gya-replace-grid,.gya-affix-grid,.gya-sequence-grid{grid-template-columns:1fr}table{min-width:720px}.gya-name-editor{flex-direction:column}.gya-name-editor textarea{border-radius:6px 6px 0 0}.gya-extension{max-width:none;border-left:1px solid #cbd5e1;border-top:0;border-radius:0 0 6px 6px}.gya-original-actions{gap:4px 10px}}
 </style>
