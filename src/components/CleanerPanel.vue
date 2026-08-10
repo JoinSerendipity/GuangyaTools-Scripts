@@ -1,13 +1,29 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue';
+import ConfirmDialog from './ConfirmDialog.vue';
 import type { CleanupMatch, CleanupRule, DirectoryRef, GuangyaItem, ProgressInfo } from '../types';
 import { FileType } from '../types';
 import type { GuangyaApiLike } from '../services/guangyaApi';
 import { scanCleanup, trashCleanupItems } from '../services/cleaner';
+import {
+  clearCleanerDefaults,
+  createCleanupRule,
+  loadCleanerDefaults,
+  saveCleanerDefaults,
+  type LoadedCleanerDefaults,
+} from '../services/cleanerDefaults';
 import { getCurrentDirectory } from '../services/pageAdapter';
+import { useConfirmation } from '../composables/useConfirmation';
 
 const props = defineProps<{ api: GuangyaApiLike; directory: DirectoryRef }>();
 const emit = defineEmits<{ close: []; completed: [] }>();
+const {
+  confirmation,
+  askConfirmation,
+  confirmConfirmation,
+  cancelConfirmation,
+  disposeConfirmation,
+} = useConfirmation();
 
 const fileTypes = [
   [FileType.IMAGE, '图片'], [FileType.VIDEO, '视频'], [FileType.AUDIO, '音频'],
@@ -16,20 +32,12 @@ const fileTypes = [
   [FileType.CODE, '代码'], [FileType.OTHER, '其他'], [FileType.UNKNOWN, '未知'],
 ] as const;
 
-let ruleSequence = 0;
-const newRule = (kind: CleanupRule['kind'] = 'suffix'): CleanupRule => ({
-  id: `rule-${Date.now()}-${ruleSequence++}`,
-  enabled: true,
-  kind,
-  pattern: kind === 'suffix' ? 'txt' : '',
-  fileType: kind === 'fileType' ? FileType.DOCUMENT : undefined,
-  matchMode: 'contains',
-  caseSensitive: false,
-  maxSizeMb: undefined,
-});
-
-const rules = ref<CleanupRule[]>([newRule('suffix')]);
-const recursive = ref(false);
+const initialDefaults = loadCleanerDefaults();
+const rules = ref<CleanupRule[]>(initialDefaults.rules);
+const recursive = ref(initialDefaults.recursive);
+const saveRecursiveSetting = ref(initialDefaults.includesRecursive);
+const hasSavedDefaults = ref(initialDefaults.source === 'saved');
+const presetMessage = ref(initialDefaults.message || (initialDefaults.source === 'saved' ? '已自动加载保存的默认规则' : ''));
 const matches = ref<CleanupMatch[]>([]);
 const selectedIds = ref(new Set<string>());
 const busy = ref(false);
@@ -57,8 +65,52 @@ function formatSize(bytes: number): string {
   return `${value.toFixed(unit ? 1 : 0)} ${units[unit]}`;
 }
 
-function addRule(): void { rules.value.push(newRule('fileName')); }
+function addRule(): void { rules.value.push(createCleanupRule('fileName')); }
 function removeRule(index: number): void { rules.value.splice(index, 1); }
+function clearScanResults(): void {
+  matches.value = [];
+  selectedIds.value = new Set();
+  failedItems.value = [];
+  progress.value = null;
+  page.value = 1;
+}
+function applyDefaults(loaded: LoadedCleanerDefaults, message: string): void {
+  rules.value = loaded.rules;
+  recursive.value = loaded.recursive;
+  saveRecursiveSetting.value = loaded.includesRecursive;
+  hasSavedDefaults.value = loaded.source === 'saved';
+  presetMessage.value = loaded.message || message;
+  errorMessage.value = '';
+  clearScanResults();
+}
+function saveCurrentDefaults(): void {
+  errorMessage.value = '';
+  try {
+    saveCleanerDefaults(rules.value, {
+      includeRecursive: saveRecursiveSetting.value,
+      recursive: recursive.value,
+    });
+    hasSavedDefaults.value = true;
+    presetMessage.value = saveRecursiveSetting.value
+      ? `已保存 ${rules.value.length} 条默认规则，并记住“包含全部子目录”为${recursive.value ? '开启' : '关闭'}`
+      : `已保存 ${rules.value.length} 条默认规则；未保存递归设置`;
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error);
+  }
+}
+function restoreSavedDefaults(): void {
+  const loaded = loadCleanerDefaults();
+  applyDefaults(loaded, loaded.source === 'saved' ? '已恢复保存的默认规则' : '没有可恢复的已保存默认规则');
+}
+async function restoreBuiltInDefaults(): Promise<void> {
+  if (hasSavedDefaults.value && !await askConfirmation({
+    title: '清除已保存的默认规则',
+    message: '将删除已保存的规则和递归设置，并恢复内置 txt 后缀规则。此操作不会清理任何网盘文件。',
+    confirmText: '清除并恢复',
+    danger: true,
+  })) return;
+  applyDefaults(clearCleanerDefaults(), '已清除保存并恢复内置 txt 默认规则');
+}
 function toggleItem(fileId: string, checked: boolean): void {
   const next = new Set(selectedIds.value);
   checked ? next.add(fileId) : next.delete(fileId);
@@ -123,7 +175,17 @@ async function execute(items = selectedItems.value): Promise<void> {
     errorMessage.value = '当前目录已经变化，请关闭面板后重新扫描';
     return;
   }
-  if (!window.confirm(`将 ${items.length} 项移入回收站（文件合计 ${formatSize(items.reduce((s, i) => s + (i.resType === 1 ? i.fileSize : 0), 0))}），是否继续？`)) return;
+  if (!await askConfirmation({
+    title: '将选中项移入回收站',
+    message: `即将把 ${items.length} 项移入回收站，文件合计 ${formatSize(items.reduce((s, i) => s + (i.resType === 1 ? i.fileSize : 0), 0))}。不会永久删除或清空回收站。`,
+    confirmText: '移入回收站',
+    danger: true,
+  })) return;
+  const confirmedCurrent = getCurrentDirectory();
+  if (!confirmedCurrent || confirmedCurrent.id !== props.directory.id) {
+    errorMessage.value = '确认期间当前目录已经变化，请关闭面板后重新扫描';
+    return;
+  }
 
   busy.value = true;
   errorMessage.value = '';
@@ -148,7 +210,10 @@ async function execute(items = selectedItems.value): Promise<void> {
 }
 
 function cancel(): void { controller?.abort(new DOMException('用户取消操作', 'AbortError')); }
-onBeforeUnmount(cancel);
+onBeforeUnmount(() => {
+  cancel();
+  disposeConfirmation();
+});
 </script>
 
 <template>
@@ -186,6 +251,16 @@ onBeforeUnmount(cancel);
           <button class="gya-secondary" :disabled="busy" @click="addRule">＋ 添加规则</button>
         </div>
 
+        <div class="gya-defaults">
+          <label><input v-model="saveRecursiveSetting" type="checkbox" :disabled="busy"> 保存时同时记住“包含全部子目录”设置</label>
+          <div class="gya-default-buttons">
+            <button class="gya-secondary" :disabled="busy" @click="saveCurrentDefaults">保存当前为默认</button>
+            <button class="gya-secondary" :disabled="busy || !hasSavedDefaults" @click="restoreSavedDefaults">恢复已保存默认</button>
+            <button class="gya-secondary" :disabled="busy" @click="restoreBuiltInDefaults">清除保存并恢复内置默认</button>
+          </div>
+        </div>
+        <p v-if="presetMessage" class="gya-preset-message">{{ presetMessage }}</p>
+
         <div class="gya-actions">
           <button class="gya-primary" :disabled="busy" @click="scan">预扫描</button>
           <button v-if="busy" class="gya-secondary" @click="cancel">取消后续操作</button>
@@ -218,8 +293,13 @@ onBeforeUnmount(cancel);
       </section>
     </div>
   </Teleport>
+  <ConfirmDialog
+    :options="confirmation"
+    @confirm="confirmConfirmation"
+    @cancel="cancelConfirmation"
+  />
 </template>
 
 <style scoped>
-.gya-mask{position:fixed;inset:0;z-index:2147483645;background:rgba(15,23,42,.42);display:flex;justify-content:flex-end;font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;color:#1f2937}.gya-panel{width:min(980px,94vw);height:100vh;overflow:auto;background:#fff;padding:20px 24px;box-sizing:border-box;box-shadow:-8px 0 30px rgba(0,0,0,.16)}header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid #e5e7eb;margin-bottom:14px}h2{margin:0;font-size:22px}header p{margin:4px 0 14px;color:#64748b}.gya-close{border:0;background:none;font-size:30px;cursor:pointer}.gya-scope{display:flex;justify-content:space-between;gap:12px;padding:10px 12px;background:#fff7ed;border-radius:8px;color:#9a3412}.gya-rules{margin:14px 0}.gya-rule{display:grid;grid-template-columns:auto 120px minmax(150px,1fr) 105px auto 135px auto;gap:8px;align-items:center;margin:8px 0}.gya-rule input,.gya-rule select{border:1px solid #cbd5e1;border-radius:6px;padding:7px;min-width:0}.gya-mini,.gya-size{white-space:nowrap;font-size:12px}.gya-size input{width:66px}.gya-actions,.gya-summary,footer,.gya-pagination{display:flex;align-items:center;gap:10px}.gya-actions{margin:14px 0}.gya-progress{margin:10px 0 12px}.gya-progress-head{display:flex;justify-content:space-between;gap:12px;color:#475569;font-size:13px}.gya-progress-track{height:8px;background:#e2e8f0;border-radius:999px;overflow:hidden;margin-top:5px}.gya-progress-track span{display:block;height:100%;background:linear-gradient(90deg,#2563eb,#60a5fa);transition:width .2s ease}.gya-summary{justify-content:space-between;margin-top:16px}.gya-summary button,.gya-pagination button{border:0;background:none;color:#2563eb;cursor:pointer}.gya-primary,.gya-secondary,.gya-danger{border:0;border-radius:7px;padding:8px 14px;cursor:pointer}.gya-primary{background:#2563eb;color:#fff}.gya-secondary{background:#e2e8f0;color:#1e293b}.gya-danger{background:#dc2626;color:#fff}.gya-danger-link{border:0;background:none;color:#dc2626;cursor:pointer}.gya-error{color:#b91c1c;background:#fef2f2;padding:8px 10px;border-radius:6px}.gya-table-wrap{overflow:auto;max-height:44vh;margin-top:8px;border:1px solid #e5e7eb;border-radius:7px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;border-bottom:1px solid #f1f5f9;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}th{position:sticky;top:0;background:#f8fafc}.gya-pagination{justify-content:center;margin:8px}footer{justify-content:flex-end;margin-top:12px}button:disabled{opacity:.5;cursor:not-allowed}@media(max-width:760px){.gya-rule{grid-template-columns:auto 1fr}.gya-scope{flex-direction:column}.gya-panel{padding:14px}}
+.gya-mask{position:fixed;inset:0;z-index:2147483645;background:rgba(15,23,42,.42);display:flex;justify-content:flex-end;font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;color:#1f2937}.gya-panel{width:min(980px,94vw);height:100vh;overflow:auto;background:#fff;padding:20px 24px;box-sizing:border-box;box-shadow:-8px 0 30px rgba(0,0,0,.16)}header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid #e5e7eb;margin-bottom:14px}h2{margin:0;font-size:22px}header p{margin:4px 0 14px;color:#64748b}.gya-close{border:0;background:none;font-size:30px;cursor:pointer}.gya-scope{display:flex;justify-content:space-between;gap:12px;padding:10px 12px;background:#fff7ed;border-radius:8px;color:#9a3412}.gya-rules{margin:14px 0}.gya-defaults{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px}.gya-default-buttons{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}.gya-preset-message{margin:8px 0;color:#1d4ed8;background:#eff6ff;padding:7px 10px;border-radius:6px}.gya-rule{display:grid;grid-template-columns:auto 120px minmax(150px,1fr) 105px auto 135px auto;gap:8px;align-items:center;margin:8px 0}.gya-rule input,.gya-rule select{border:1px solid #cbd5e1;border-radius:6px;padding:7px;min-width:0}.gya-mini,.gya-size{white-space:nowrap;font-size:12px}.gya-size input{width:66px}.gya-actions,.gya-summary,footer,.gya-pagination{display:flex;align-items:center;gap:10px}.gya-actions{margin:14px 0}.gya-progress{margin:10px 0 12px}.gya-progress-head{display:flex;justify-content:space-between;gap:12px;color:#475569;font-size:13px}.gya-progress-track{height:8px;background:#e2e8f0;border-radius:999px;overflow:hidden;margin-top:5px}.gya-progress-track span{display:block;height:100%;background:linear-gradient(90deg,#2563eb,#60a5fa);transition:width .2s ease}.gya-summary{justify-content:space-between;margin-top:16px}.gya-summary button,.gya-pagination button{border:0;background:none;color:#2563eb;cursor:pointer}.gya-primary,.gya-secondary,.gya-danger{border:0;border-radius:7px;padding:8px 14px;cursor:pointer}.gya-primary{background:#2563eb;color:#fff}.gya-secondary{background:#e2e8f0;color:#1e293b}.gya-danger{background:#dc2626;color:#fff}.gya-danger-link{border:0;background:none;color:#dc2626;cursor:pointer}.gya-error{color:#b91c1c;background:#fef2f2;padding:8px 10px;border-radius:6px}.gya-table-wrap{overflow:auto;max-height:44vh;margin-top:8px;border:1px solid #e5e7eb;border-radius:7px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px;border-bottom:1px solid #f1f5f9;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}th{position:sticky;top:0;background:#f8fafc}.gya-pagination{justify-content:center;margin:8px}footer{justify-content:flex-end;margin-top:12px}button:disabled{opacity:.5;cursor:not-allowed}@media(max-width:760px){.gya-rule{grid-template-columns:auto 1fr}.gya-scope,.gya-defaults{flex-direction:column;align-items:stretch}.gya-default-buttons{justify-content:flex-start}.gya-panel{padding:14px}}
 </style>

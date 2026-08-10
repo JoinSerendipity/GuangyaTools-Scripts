@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import ConfirmDialog from './ConfirmDialog.vue';
 import type { BatchRenameRules, DirectoryRef, GuangyaItem, ProgressInfo, RenameConflictPolicy, RenamePlanEntry } from '../types';
 import type { GuangyaApiLike } from '../services/guangyaApi';
 import {
@@ -9,9 +10,17 @@ import {
   splitFileName,
 } from '../services/batchRename';
 import { getCurrentDirectory } from '../services/pageAdapter';
+import { useConfirmation } from '../composables/useConfirmation';
 
 const props = defineProps<{ api: GuangyaApiLike; items: GuangyaItem[]; directory: DirectoryRef }>();
 const emit = defineEmits<{ close: []; completed: [] }>();
+const {
+  confirmation,
+  askConfirmation,
+  confirmConfirmation,
+  cancelConfirmation,
+  disposeConfirmation,
+} = useConfirmation();
 
 const rules = ref<BatchRenameRules>({ ...DEFAULT_BATCH_RENAME_RULES });
 const conflictPolicy = ref<RenameConflictPolicy>('skip');
@@ -135,7 +144,12 @@ async function execute(): Promise<void> {
   }
   const skipped = currentPlan.entries.length - currentPlan.ready.length;
   const conflictText = conflictPolicy.value === 'skip' ? '冲突项会跳过' : '冲突项会自动追加 (1)、(2) 等';
-  if (!window.confirm(`将重命名 ${currentPlan.ready.length} 项，另有 ${skipped} 项不执行；${conflictText}。是否继续？`)) return;
+  if (!await askConfirmation({
+    title: '确认批量重命名',
+    message: `将重命名 ${currentPlan.ready.length} 项，另有 ${skipped} 项不执行。${conflictText}。`,
+    confirmText: '开始重命名',
+  })) return;
+  if (!ensureDirectory()) return;
 
   busy.value = true;
   errorMessage.value = '';
@@ -159,7 +173,10 @@ async function execute(): Promise<void> {
 
 function cancel(): void { controller?.abort(new DOMException('用户取消操作', 'AbortError')); }
 onMounted(loadSiblings);
-onBeforeUnmount(cancel);
+onBeforeUnmount(() => {
+  cancel();
+  disposeConfirmation();
+});
 </script>
 
 <template>
@@ -257,6 +274,11 @@ onBeforeUnmount(cancel);
       </section>
     </div>
   </Teleport>
+  <ConfirmDialog
+    :options="confirmation"
+    @confirm="confirmConfirmation"
+    @cancel="cancelConfirmation"
+  />
 </template>
 
 <style scoped>

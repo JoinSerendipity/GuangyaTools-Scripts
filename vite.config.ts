@@ -19,7 +19,7 @@ export default defineConfig({
           'https://www.guangyapan.com/*',
         ],
         connect: ['api.guangyapan.com'],
-        grant: ['unsafeWindow'],
+        grant: ['unsafeWindow', 'GM_getValue', 'GM_setValue', 'GM_deleteValue'],
         'run-at': 'document-start',
       },
       build: {

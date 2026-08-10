@@ -1,12 +1,21 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
+import ConfirmDialog from './ConfirmDialog.vue';
 import type { FlattenDirectoryResult, GuangyaItem, ProgressInfo } from '../types';
 import type { GuangyaApiLike } from '../services/guangyaApi';
 import { createFlattenPlan, flattenDirectories, type FlattenConflictMode } from '../services/flattenSubfolders';
 import { getCurrentDirectory } from '../services/pageAdapter';
+import { useConfirmation } from '../composables/useConfirmation';
 
 const props = defineProps<{ api: GuangyaApiLike; directories: GuangyaItem[]; originDirectoryId: string }>();
 const emit = defineEmits<{ close: []; completed: [] }>();
+const {
+  confirmation,
+  askConfirmation,
+  confirmConfirmation,
+  cancelConfirmation,
+  disposeConfirmation,
+} = useConfirmation();
 
 interface PreviewRow {
   directory: GuangyaItem;
@@ -169,7 +178,13 @@ async function execute(targets = props.directories): Promise<void> {
     : trashesConflicts.value
       ? `${conflicts} 个候选重名文件将移入回收站；其直接父目录仅在复扫确认没有其他文件时才会回收`
       : `${conflicts} 个同名冲突文件会保留不处理`;
-  if (!window.confirm(`将处理 ${targets.length} 个目录，提交移动约 ${moving} 个文件；${conflictMessage}。仅在确认子目录树无文件后才移入回收站。是否继续？`)) return;
+  if (!await askConfirmation({
+    title: '确认解散子目录',
+    message: `将处理 ${targets.length} 个目录，提交移动约 ${moving} 个文件。\n${conflictMessage}。\n仅在复扫确认子目录树没有文件后，才会将空目录移入回收站。`,
+    confirmText: '开始处理',
+    danger: true,
+  })) return;
+  if (!ensureOrigin()) return;
 
   busy.value = true;
   errorMessage.value = '';
@@ -189,7 +204,10 @@ async function execute(targets = props.directories): Promise<void> {
 }
 
 function cancel(): void { controller?.abort(new DOMException('用户取消操作', 'AbortError')); }
-onBeforeUnmount(cancel);
+onBeforeUnmount(() => {
+  cancel();
+  disposeConfirmation();
+});
 </script>
 
 <template>
@@ -238,6 +256,11 @@ onBeforeUnmount(cancel);
       </section>
     </div>
   </Teleport>
+  <ConfirmDialog
+    :options="confirmation"
+    @confirm="confirmConfirmation"
+    @cancel="cancelConfirmation"
+  />
 </template>
 
 <style scoped>
